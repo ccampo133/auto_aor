@@ -1,0 +1,267 @@
+#! /usr/bin/env python
+# auto_aor version 2.0
+# $Author: ccampo $
+# $Revision: 640 $
+# $Date: 2012-04-19 16:07:30 -0400 (Thu, 19 Apr 2012) $
+# $HeadURL: file:///home/esp01/svn/code/auto_aor/trunk/auto_aor $
+# $Id: auto_aor 640 2012-04-19 20:07:30Z ccampo $
+
+import numpy   as np
+import rdfile  as rd
+import aorcalc
+import aorstr
+import sys
+import os
+import time
+import spitztimingrep
+import aor_diagnostics as aordiag
+import orbit
+import tepclass as tc
+
+##########################################################
+# STEP 1 - Read and update all information about the AOR #
+##########################################################
+
+tepname = sys.argv[1]   # tep file name and path (cmd line 2nd arg)
+aainame = sys.argv[2]   # aai "" (cmd line 3rd arg) 
+visname = sys.argv[3]   # vis "" (cmd line 4th arg)
+info    = {}            # master dictionary containing ALL AOR information
+
+"""
+tepname = '/home/jasmina/ast/esp01/HAT-P-16b/HAT-P-16b-2010-06-08-01.tep'
+aainame = '/home/jasmina/ast/esp01/HAT-P-16b/HAT-P-16b-ecl-ch1-2010-06-08_01_no_pointing.aai'
+visname = '/home/jasmina/ast/esp01/HAT-P-16b/HAT-P-16b-2010-06-08.vis'
+info    = {}
+"""
+
+# get the files
+tep   = tc.tepfile(tepname)   # FINDME: ccampo 9/13/11 - using new tep reader
+#tep2  = rd.rdfile(tepname)
+aai   = rd.rdfile(aainame)
+vis   = rd.rdvis(visname, juldat=True)
+
+# FINDME: ccampo 9/13/11 -
+# turn tep into a dictionary since tepclass returns a tepfile object, not a dictionary
+tepdict = {}
+for key in dir(tep)[3:]:
+    badkeys = ['convunits', 'fname', 'version']
+    if key not in badkeys:
+        try:
+            exec("tepdict[\'{0}\'] = (float(tep.{0}.val), float(tep.{0}.uncert))".format(key))
+        except ValueError:
+            exec("tepdict[\'{0}\'] = (tep.{0}.val, float(tep.{0}.uncert))".format(key))
+        
+#assert tepdict == tep2
+    
+dlist = [tepdict, aai]  # list of each dictionary
+
+# update the info
+info['tepname'] = tepname        # filename of tep used in AOR 
+info['aainame'] = aainame        # filename of aai used in AOR
+info['visname'] = visname        # filename of vis used in AOR
+info['vis']     = vis            # object's Spitzer visibility windows (JD)
+for file in dlist:
+    nitems = len(file.keys())    # number of items in each dictionary
+    for i in range(nitems):
+        key       = file.keys()[i]
+        val       = file.values()[i]
+        info[key] = val
+
+############################################
+# STEP 2 - Check and update default values # 
+############################################
+
+# remove uncertainties from fields that do not have any...
+# ...unless it is one of these parameters
+nouncert = ['ecldur', 'transdur', 'eclphase', 'pmra',
+            'pmdec', 'period', 'ttrans', 'e', 'omega',
+            'i', 'a']
+for i in range(len(info.values())):
+    key = info.keys()[i]
+    try:
+        item = info[key]
+        if key not in nouncert:
+            if item[1] == -1:
+                info[key] = item[0]
+    except:
+        continue
+
+# FINDME: ccampo 9/13/2011 new tep reader gives RA and DEC in radians    
+# convert RA and DEC back to HH:MM:SS format
+import dec2sexa as d2s
+ra  = d2s.dec2sexa1(tep.ra.val  * 12.0  / np.pi)
+dec = d2s.dec2sexa1(tep.dec.val * 180.0 / np.pi)
+
+# fix stupid negative sign issue (a space exists in the str instead of a zero)
+if ra[0] == '-' and ra[1] == ' ':
+    ra = '-0' + ra[2:]
+if dec[0] == '-' and dec[1] == ' ':
+    dec = '-0' + dec[2:]
+    
+info['ra']  = ra.lstrip()   # remove beginning whitespace
+info['dec'] = dec.lstrip()
+
+
+# check uncertainties per Joe's request
+aorcalc.check_uncert(info, nouncert)
+
+# add arbitrary offset in RA and DEC for co AOR if unspecified
+if info['co_ra'] == -1 and info['co_dec'] == -1:
+    # for RA
+    co_ra      = info['ra'].split(':')
+    co_ra[-1]  = str(float(co_ra[-1]) + 10)
+    # for DEC
+    co_dec     = info['dec'].split(':')
+    co_dec[-1] = str(float(co_dec[-1]) + 10)
+    
+    # check if over 60 seconds
+    if float(co_ra[-1]) >= 60:
+        co_ra[-1] = str(float(co_ra[-1]) - 60)
+        co_ra[-2] = str(int(co_ra[-2]) + 1)
+    if float(co_dec[-1]) >= 60:
+        co_dec[-1] = str(float(co_dec[-1]) - 60)
+        co_dec[-2] = str(int(co_dec[-2]) + 1)
+        
+    # check if over 60 minutes
+    if float(co_ra[-2]) >= 60:
+        co_ra[-2] = str(float(co_ra[-2]) - 60)
+        co_ra[-3] = str(int(co_ra[-3]) + 1)
+    if float(co_dec[-2]) >= 60:
+        co_dec[-2] = str(float(co_dec[-2]) - 60)
+        co_dec[-3] = str(int(co_dec[-3]) + 1)
+        
+    # final strings
+    co_ra  = co_ra[0] + ':' + co_ra[1] + ':' + co_ra[2]
+    co_dec = co_dec[0] + ':' + co_dec[1] + ':' + co_dec[2]
+    info['co_ra']  = co_ra
+    info['co_dec'] = co_dec
+    
+# default event to eclipse
+if info['event'] == -1:
+    info['event'] = 'eclipse'
+
+# calculate phase? flag.
+info['phasecalc'] = False
+
+# make sure transit phase is 0, otherwise calculate a phase
+if info['event'] == 'transit':
+    info['evphase'] = 0.
+else:
+    info['evphase']   = aorcalc.get_phase(info)
+
+# get the readout and overhead times
+info['rdout'], info['overhead'] = aorcalc.exppars(info['readmode'],
+                                                  info['frametime'])
+
+# get the event type
+if info['event'] == 'eclipse':
+    evdur = 'ecldur'
+elif info['event'] == 'transit':
+    evdur = 'transdur'
+elif info['event'] == 'orbit':
+    pass #FINDME need to add
+
+# get the duration
+# FINDME: NOT WORKING AS OF 9/13/2011
+if info[evdur][0] == -1:
+    #raise Exception("duration calculation not yet implemented!! Please specifiy an eclipse or transit duration!")
+    print("Parameter {0} not specified!  Calculating {0}...".format(evdur))
+    info[evdur] = aorcalc.getduration(info, evdur)
+     
+# calculate number of frames, duration
+if info['nframes'] == -1 and info['duration'] == -1:    
+    # DURATION IS IN SECONDS
+    # duration is: start - 1hr --- dt --- evdur --- dt - end
+    # dt is a baseline time defined as max(evdur/2, 2hrs)
+    dt               = np.max((info[evdur][0]/2., 2*3600.))
+    info['duration'] = info[evdur][0] + 2*dt + 3600
+    
+    # get the number of frames
+    info['nframes'] = aorcalc.get_nfrms(info['duration'],
+                                        info['frametime'],
+                                        info['rdout'],
+                                        info['overhead'])
+elif info['nframes'] == -1 and info['duration'] != -1:  # get number of frames given duration
+    info['nframes'] = aorcalc.get_nfrms(info['duration'],
+                                        info['frametime'],
+                                        info['rdout'],
+                                        info['overhead'])
+elif info['duration'] == -1 and info['nframes'] != -1:  # get duration given number of frames
+    info['duration'] = aorcalc.get_dur(info['nframes'],
+                                       info['frametime'],
+                                       info['rdout'],
+                                       info['overhead'])
+else:
+    print('INVALID')
+    print('Duration and number of frames BOTH defined.  Please choose ONE to use and re-run auto_aor!')
+    
+# ALL TIMES IN SECONDS
+# default start time window to a half hour
+if info['startwin'] == -1:
+    info['startwin'] = 1800.   
+
+# shift observation time by an hour to allow the 1hr chop
+if info['ctrshift'] != None:
+    info['ctrshift'] += 3600.
+    
+# calculate offsets
+if info['readmode'] == 'full_array':
+    if info['off_row'] == -1 and info['off_col'] == -1:
+        info['off_row'], info['off_col'] = aorcalc.get_offsets(info['chan'])
+else:
+    # subarray doesn't have offsets
+    info['off_row'], info['off_col'] = (0., 0.)
+    
+# specify AOR names (aor and diagnostics)
+# all AORs have a secondary observation (co) to check for hot pixels
+info['aorname']  = info['planetname'].replace('-', '') + "-" + info['event'][:3] + "-ch" +\
+                   str(int(info['chan'])) + "-" + str(int(info['shotnum']))
+
+# default AOR filenames
+if info['filename'] == -1:
+    info['filename'] = info['aorname'] + "-auto.aor"
+
+info['diagname'] = info['aorname'] + "-auto-diag.aao"
+
+#############################################
+# STEP 3 - Get timing data and generate AOR #
+#############################################
+
+# FINDME: ccampo 9/14/2011
+# UNIT CONVERSIONS NEED TO BE DONE HERE NOW SINCE TEP FILE IS IN SI UNITS
+# convert period from seconds to days
+info['period'] = (info['period'][0]/86400., info['period'][1]/86400.)
+
+
+# get timing constraints
+info['tconst'] = spitztimingrep.spitztimingrep(info['planetname'], # planet name, str
+                                               info['event'],      # type of event, str
+                                               info['evphase'],    # orbit phase of eclipse, float
+                                               info['duration'],   # event duration, SECONDS
+                                               info['startwin'],   # start wime window, SECONDS
+                                               info['vis'],        # visibility windows, array
+                                               info['ttrans'],     # transit mid-time and error, BJD
+                                               info['period'],     # orbit period and error, DAYS
+                                               info['toff'],       # offset time from ephemeris, BJD
+                                               info['ctrshift'],   # shift from event center, SECONDS
+                                               ecldur = info[evdur][0] # eclipse/transit duration, SECONDS
+                                               )
+# write out diagnostics file (ephemeris)
+info['diagnostics'] = aordiag.diagnostics(info)
+
+# make aor
+info['aor'] = aorstr.aorstr(info)
+
+##################################
+# STEP 4 - Print results to file #
+##################################
+
+# write AOR file
+AOR = open(info['filename'], 'w')
+AOR.write(info['aor'])
+AOR.close()
+
+# write AAO file (diagnostics)
+AAO = open(info['diagname'], 'w')
+AAO.write(info['diagnostics'])
+AAO.close()
